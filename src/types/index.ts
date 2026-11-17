@@ -119,10 +119,10 @@ export interface AgreementTemplate {
   generalResponsibilities: string[];
   participationRequirements: string[];
   termsAndConditions: string;
-  defaultDurationMonths: number;
-  isActive: boolean;
-  updatedBy: string;
-  updatedAt: Timestamp;
+  defaultDurationMonths?: number;
+  isActive?: boolean;
+  createdAt?: any;  // <-- Add this
+  updatedAt?: any;  // <-- Add this
 }
 
 /** Collection: agreements */
@@ -218,4 +218,16 @@ export interface AuditLog {
   targetId: string;
   metadata: Record<string, unknown>;
   timestamp: Timestamp;
+}
+
+export type ResponsibilityScope = "general" | "working_group" | "sub_team" | "leadership";
+
+export interface ResponsibilityItem {
+  id: string;
+  scope: ResponsibilityScope;
+  targetId?: string | null; // workingGroupId or subTeamId if applicable
+  title: string;
+  description: string;
+  isActive: boolean;
+  createdAt?: any;
 }

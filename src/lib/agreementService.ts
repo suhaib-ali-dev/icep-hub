@@ -7,35 +7,62 @@ import {
   getDoc,
   query,
   where,
-  orderBy,
   serverTimestamp,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { logAuditAction } from "@/lib/orgService";
 import { AgreementTemplate, Agreement, UserRole, AgreementType } from "@/types";
 
+function toMillis(ts: any): number {
+  if (!ts) return 0;
+  if (typeof ts.toMillis === "function") return ts.toMillis();
+  if (ts instanceof Date) return ts.getTime();
+  return 0;
+}
+
 export async function fetchAgreementTemplates(): Promise<AgreementTemplate[]> {
-  const q = query(collection(db, "agreementTemplates"), orderBy("createdAt", "desc"));
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() } as AgreementTemplate));
+  const snap = await getDocs(collection(db, "agreementTemplates"));
+  const list = snap.docs.map(
+    (d) => ({ ...d.data(), id: d.id } as AgreementTemplate)
+  );
+  return list.sort(
+    (a, b) => toMillis((b as any).createdAt) - toMillis((a as any).createdAt)
+  );
 }
 
 export async function fetchAgreements(user: {
   uid: string;
-  role: UserRole;
+  role: string; // or UserRole
+  workingGroupId?: string | null;
 }): Promise<Agreement[]> {
-  let q;
-  if (["super_admin", "exec_committee"].includes(user.role)) {
-    q = query(collection(db, "agreements"), orderBy("submittedAt", "desc"));
+  let snap;
+  
+  // Allow admins, executive committee, working group chairs, and team leaders to view all submissions
+  const isElevatedRole = [
+    "super_admin",
+    "exec_committee",
+    "admin",
+    "wg_chair",
+    "team_leader",
+  ].includes(user.role);
+
+  if (isElevatedRole) {
+    snap = await getDocs(collection(db, "agreements"));
   } else {
-    q = query(
+    if (!user.uid) return [];
+    const q = query(
       collection(db, "agreements"),
-      where("userId", "==", user.uid),
-      orderBy("submittedAt", "desc")
+      where("userId", "==", user.uid)
     );
+    snap = await getDocs(q);
   }
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() } as Agreement));
+
+  const list = snap.docs.map((d) => ({ ...d.data(), id: d.id } as Agreement));
+  return list.sort(
+    (a, b) =>
+      (toMillis(b.submittedAt) || toMillis(b.createdAt)) -
+      (toMillis(a.submittedAt) || toMillis(a.createdAt))
+  );
 }
 
 export async function createAgreementTemplate(
@@ -78,6 +105,14 @@ export async function getOrCreateMemberAgreement(
   userId: string,
   templateId: string
 ): Promise<string> {
+  if (!userId || userId === "undefined" || !templateId || templateId === "undefined") {
+    throw new Error(
+      `Missing required ID in getOrCreateMemberAgreement (userId: ${String(
+        userId
+      )}, templateId: ${String(templateId)})`
+    );
+  }
+
   const existingQuery = query(
     collection(db, "agreements"),
     where("userId", "==", userId),
@@ -88,12 +123,14 @@ export async function getOrCreateMemberAgreement(
     return existingSnap.docs[0].id;
   }
 
-  // Fetch user, template, working group, and sub-team in parallel
   const userDoc = await getDoc(doc(db, "users", userId));
   const templateDoc = await getDoc(doc(db, "agreementTemplates", templateId));
 
-  if (!userDoc.exists() || !templateDoc.exists()) {
-    throw new Error("User or Agreement Template not found.");
+  if (!userDoc.exists()) {
+    throw new Error(`User document not found in Firestore for ID: ${userId}`);
+  }
+  if (!templateDoc.exists()) {
+    throw new Error(`Agreement Template document not found in Firestore for ID: ${templateId}`);
   }
 
   const userData = userDoc.data();
@@ -121,7 +158,9 @@ export async function getOrCreateMemberAgreement(
 
   const startDate = new Date();
   const endDate = new Date();
-  endDate.setMonth(endDate.getMonth() + (templateData.defaultDurationMonths || 12));
+  endDate.setMonth(
+    endDate.getMonth() + (templateData.defaultDurationMonths || 12)
+  );
 
   const docRef = await addDoc(collection(db, "agreements"), {
     userId,
@@ -163,7 +202,6 @@ export async function getOrCreateMemberAgreement(
 
   return docRef.id;
 }
-
 /**
  * Save progress as draft or submit for approval
  */
@@ -177,13 +215,16 @@ export async function saveOrSubmitAgreement(
     generalResponsibilities: string[];
     workingGroupResponsibilities: string[];
     subTeamResponsibilities: string[];
+    termsSnapshot?: string;
+    workingGroupId?: string | null;
+    workingGroupName?: string;
     typedLegalName?: string;
     drawnSignatureDataUrl?: string | null;
   },
   actorId: string
 ) {
   const agreementRef = doc(db, "agreements", agreementId);
-  
+
   const updatePayload: Record<string, any> = {
     status: data.status,
     "availability.hoursPerWeek": data.committedHoursPerWeek,
@@ -195,6 +236,19 @@ export async function saveOrSubmitAgreement(
     updatedAt: serverTimestamp(),
   };
 
+  // Persist resolved Terms & Conditions snapshot if provided
+  if (data.termsSnapshot !== undefined) {
+    updatePayload.termsSnapshot = data.termsSnapshot;
+  }
+
+  // Persist resolved Working Group snapshot if provided
+  if (data.workingGroupId !== undefined) {
+    updatePayload["memberSnapshot.workingGroupId"] = data.workingGroupId;
+  }
+  if (data.workingGroupName !== undefined) {
+    updatePayload["memberSnapshot.workingGroupName"] = data.workingGroupName;
+  }
+
   if (data.status === "pending_approval") {
     updatePayload.submittedAt = serverTimestamp();
     updatePayload.signature = {
@@ -205,7 +259,6 @@ export async function saveOrSubmitAgreement(
       userAgent: typeof window !== "undefined" ? window.navigator.userAgent : "",
     };
 
-    // Update user agreement status
     const agreementSnap = await getDoc(agreementRef);
     if (agreementSnap.exists()) {
       const userId = agreementSnap.data().userId;
@@ -227,10 +280,9 @@ export async function saveOrSubmitAgreement(
     targetId: agreementId,
   });
 }
-
 export async function reviewAgreement(
   agreementId: string,
-  decision: "approved" | "needs_correction" | "rejected",
+  decision: "approved" | "needs_correction" | "rejected" | "terminated",
   adminFeedback: string,
   actor: { uid: string; role: UserRole }
 ) {

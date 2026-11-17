@@ -29,12 +29,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const router = useRouter();
 
-  const fetchUserProfile = async (uid: string) => {
+ const fetchUserProfile = async (uid: string) => {
     try {
       const docRef = doc(db, "users", uid);
       const docSnap = await getDoc(docRef);
       if (docSnap.exists()) {
-        setProfile(docSnap.data() as UserProfile);
+        const data = docSnap.data() as UserProfile;
+        // Ensure uid is always present on the profile object
+        setProfile({ ...data, uid: data.uid || uid });
       } else {
         setProfile(null);
       }
