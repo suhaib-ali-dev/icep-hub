@@ -2,6 +2,7 @@ import {
   collection,
   addDoc,
   updateDoc,
+  deleteDoc,
   doc,
   getDocs,
   getDoc,
@@ -12,6 +13,55 @@ import {
 import { db } from "@/lib/firebase";
 import { logAuditAction } from "@/lib/orgService";
 import { AgreementTemplate, Agreement, UserRole, AgreementType } from "@/types";
+
+export async function updateAgreementTemplate(
+  templateId: string,
+  updates: Partial<AgreementTemplate>
+) {
+  const ref = doc(db, "agreementTemplates", templateId);
+  await updateDoc(ref, {
+    ...updates,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+export async function deleteAgreementTemplate(templateId: string) {
+  const ref = doc(db, "agreementTemplates", templateId);
+  await deleteDoc(ref);
+}
+
+export async function queueAgreementNotification(params: {
+  to: string;
+  subject: string;
+  memberName: string;
+  agreementTitle: string;
+  eventType: "submitted" | "approved" | "needs_correction" | "rejected" | "renewal_reminder";
+  feedback?: string;
+  daysRemaining?: number;
+}) {
+  if (!params.to) return;
+
+  const bodyLines: Record<typeof params.eventType, string> = {
+    submitted: `Hello ${params.memberName},\n\nYour "${params.agreementTitle}" has been signed and submitted to the ICEP Executive Committee for review.`,
+    approved: `Hello ${params.memberName},\n\nCongratulations! Your "${params.agreementTitle}" has been approved and is now ACTIVE for a 12-month term.`,
+    needs_correction: `Hello ${params.memberName},\n\nYour "${params.agreementTitle}" has been returned for corrections.\n\nReviewer Notes:\n${params.feedback || "Please review and update your submission."}`,
+    rejected: `Hello ${params.memberName},\n\nYour "${params.agreementTitle}" was not approved.\n\nNotes:\n${params.feedback || "Please contact your Working Group Chair for details."}`,
+    renewal_reminder: `Hello ${params.memberName},\n\nReminder: Your "${params.agreementTitle}" will expire in ${params.daysRemaining} days. Please log into the ICEP Hub to renew your commitment.`,
+  };
+
+  // Writes to standard `mail` collection (Firebase Trigger Email extension) & audit log
+  await addDoc(collection(db, "mail"), {
+    to: [params.to],
+    message: {
+      subject: params.subject,
+      text: bodyLines[params.eventType],
+    },
+    metadata: {
+      eventType: params.eventType,
+      createdAt: serverTimestamp(),
+    },
+  });
+}
 
 function toMillis(ts: any): number {
   if (!ts) return 0;
@@ -100,8 +150,7 @@ export async function createAgreementTemplate(
 
 /**
  * Step 3 & 4: Generate or fetch agreement with 3-tier responsibility hierarchy
- */
-export async function getOrCreateMemberAgreement(
+ */export async function getOrCreateMemberAgreement(
   userId: string,
   templateId: string
 ): Promise<string> {
@@ -136,23 +185,41 @@ export async function getOrCreateMemberAgreement(
   const userData = userDoc.data();
   const templateData = templateDoc.data();
 
+  // Robustly catch working group ID from any common field variant
+  const wgId = 
+    userData.workingGroupId || 
+    userData.workingGroup || 
+    userData.wgId || 
+    null;
+
   let wgName = "Unassigned";
   let wgResponsibilities: string[] = [];
-  if (userData.workingGroupId) {
-    const wgDoc = await getDoc(doc(db, "workingGroups", userData.workingGroupId));
+  
+  if (wgId) {
+    const wgDoc = await getDoc(doc(db, "workingGroups", wgId));
     if (wgDoc.exists()) {
-      wgName = wgDoc.data().name || "Unassigned";
-      wgResponsibilities = wgDoc.data().defaultResponsibilities || [];
+      const wgData = wgDoc.data();
+      // Check multiple title field options to prevent "Unassigned"
+      wgName = wgData.name || wgData.title || wgData.groupName || wgData.label || wgId;
+      wgResponsibilities = wgData.defaultResponsibilities || wgData.responsibilities || [];
+    } else {
+      // Fallback if wgId itself is stored as a string name instead of document ID
+      wgName = wgId;
     }
   }
 
+  const stId = userData.subTeamId || userData.subTeam || null;
   let stName = "None";
   let stResponsibilities: string[] = [];
-  if (userData.subTeamId) {
-    const stDoc = await getDoc(doc(db, "subTeams", userData.subTeamId));
+  
+  if (stId) {
+    const stDoc = await getDoc(doc(db, "subTeams", stId));
     if (stDoc.exists()) {
-      stName = stDoc.data().name || "None";
-      stResponsibilities = stDoc.data().defaultResponsibilities || [];
+      const stData = stDoc.data();
+      stName = stData.name || stData.title || stData.groupName || stId;
+      stResponsibilities = stData.defaultResponsibilities || [];
+    } else {
+      stName = stId;
     }
   }
 
@@ -169,12 +236,12 @@ export async function getOrCreateMemberAgreement(
     version: templateData.version || 1,
     status: "draft",
     memberSnapshot: {
-      fullName: userData.fullName || "",
+      fullName: userData.fullName || userData.name || "",
       email: userData.email || "",
       country: userData.country || "",
-      workingGroupId: userData.workingGroupId || null,
+      workingGroupId: wgId,
       workingGroupName: wgName,
-      subTeamId: userData.subTeamId || null,
+      subTeamId: stId,
       subTeamName: stName,
       positionTitle: userData.positionTitle || "Member",
     },

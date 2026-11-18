@@ -5,10 +5,12 @@ import { doc, getDoc, collection, query, where, getDocs } from "firebase/firesto
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
 import { canManageOrganization } from "@/lib/permissions";
+import { downloadOfficialAgreementPdf } from "@/lib/agreementPdfGenerator";
 import {
   fetchAgreementTemplates,
   fetchAgreements,
   createAgreementTemplate,
+  deleteAgreementTemplate,
   getOrCreateMemberAgreement,
   saveOrSubmitAgreement,
   reviewAgreement,
@@ -101,6 +103,10 @@ export default function ContractsPage() {
   // Admin View Toggle
   const [viewMode, setViewMode] = useState<"admin" | "member">("admin");
 
+  // Template Inspection & Editing State
+  const [inspectingTemplate, setInspectingTemplate] = useState<AgreementTemplate | null>(null);
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+
   // Template Modal (Admin)
   const [showTemplateModal, setShowTemplateModal] = useState(false);
   const [tplType, setTplType] = useState<AgreementType>("membership_commitment");
@@ -112,6 +118,19 @@ export default function ContractsPage() {
   const [tplTerms, setTplTerms] = useState("");
   const [tplDuration, setTplDuration] = useState<number>(12);
   const [creatingTpl, setCreatingTpl] = useState(false);
+
+  // Helper function to safely parse Firestore Timestamps or date strings
+const parseSafeDate = (val: any): Date | null => {
+  if (!val) return null;
+  if (typeof val.toDate === "function") return val.toDate();
+  if (val instanceof Date) return val;
+  try {
+    const d = new Date(val);
+    return isNaN(d.getTime()) ? null : d;
+  } catch (err) {
+    return null;
+  }
+};
 
   // Member Document Form / Preview & Wizard Stage State (Stage 1 -> Stage 2 -> Stage 3)
   const [wizardStage, setWizardStage] = useState<1 | 2 | 3>(1);
@@ -624,6 +643,29 @@ export default function ContractsPage() {
     }
   };
 
+  const openEditTemplateModal = (tpl: AgreementTemplate) => {
+    setEditingTemplateId(tpl.id);
+    setTplType(tpl.type || "membership_commitment");
+    setTplTitle(tpl.title);
+    setTplVersion(tpl.version || 1);
+    setTplIntro(tpl.introductionText || "");
+    setTplGeneralResp((tpl.generalResponsibilities || []).join("\n"));
+    setTplParticipation((tpl.participationRequirements || []).join("\n"));
+    setTplTerms(tpl.termsAndConditions || "");
+    setTplDuration(tpl.defaultDurationMonths || 12);
+    setShowTemplateModal(true); // Your existing template creation modal state
+  };
+
+  const handleDeleteTemplate = async (tpl: AgreementTemplate) => {
+    if (!window.confirm(`Delete "${tpl.title}" permanently? Existing signed member snapshots will remain preserved.`)) return;
+    try {
+      await deleteAgreementTemplate(tpl.id);
+      await loadData();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to delete template.");
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -728,15 +770,16 @@ export default function ContractsPage() {
                 const status = existingAgr ? existingAgr.status : "not_started";
 
                 let validityText = null;
-                try {
-                  const start = existingAgr?.duration?.startDate?.toDate ? existingAgr.duration.startDate.toDate() : existingAgr?.duration?.startDate ? new Date(existingAgr.duration.startDate) : null;
-                  const end = existingAgr?.duration?.endDate?.toDate ? existingAgr.duration.endDate.toDate() : existingAgr?.duration?.endDate ? new Date(existingAgr.duration.endDate) : null;
-                  if (start && end && !isNaN(start.getTime()) && !isNaN(end.getTime())) {
-                    validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
-                  }
-                } catch (e) {
-                  validityText = null;
-                }
+                    try {
+                      const start = parseSafeDate(existingAgr?.duration?.startDate);
+                      const end = parseSafeDate(existingAgr?.duration?.endDate);
+
+                      if (start && end) {
+                        validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
+                      }
+                    } catch (e) {
+                      validityText = null;
+                    }
 
                 return (
                   <div
@@ -794,6 +837,22 @@ export default function ContractsPage() {
                             <Eye className="h-3.5 w-3.5" />
                             <span>View Document</span>
                           </button>
+                          {existingAgr && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                downloadOfficialAgreementPdf(
+                                  existingAgr,
+                                  existingAgr.termsSnapshot || DEFAULT_ICEP_TERMS_AND_CONDITIONS,
+                                  existingAgr.memberSnapshot?.workingGroupName
+                                )
+                              }
+                              className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#004aad] hover:bg-[#003882] text-white text-xs font-medium rounded-lg cursor-pointer transition-colors"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>Download Official PDF</span>
+                            </button>
+                          )}
                         </>
                       ) : status === "pending_approval" ? (
                         <div className="inline-flex items-center gap-1.5 px-3 py-2 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg text-xs font-medium">
@@ -824,7 +883,7 @@ export default function ContractsPage() {
         </div>
       )}
 
-      {/* ADMIN & EXEC VIEW */}
+     {/* ADMIN & EXEC VIEW */}
       {showAdminView && (
         <div className="space-y-6">
           <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs">
@@ -835,7 +894,7 @@ export default function ContractsPage() {
                   <span>Agreement Templates ({templates.length})</span>
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Published commitment and policy templates for organizational members.
+                  Published commitment and policy templates for organizational members. Click any template to inspect full contents.
                 </p>
               </div>
 
@@ -862,23 +921,52 @@ export default function ContractsPage() {
                 {templates.map((t) => (
                   <div
                     key={t.id}
-                    className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-1.5"
+                    onClick={() => setInspectingTemplate(t)}
+                    className="p-4 rounded-lg border border-slate-200 bg-slate-50 hover:border-indigo-300 hover:bg-indigo-50/20 transition-all cursor-pointer space-y-2"
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="font-semibold text-sm text-slate-900">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="font-semibold text-sm text-slate-900 hover:text-[#004aad]">
                         {t.title}
                       </div>
-                      <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-medium">
-                        v{t.version}
-                      </span>
+                      <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                        <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-medium">
+                          v{t.version}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setInspectingTemplate(t)}
+                          title="Inspect Full Template"
+                          className="p-1 text-slate-500 hover:text-[#004aad] rounded hover:bg-white cursor-pointer"
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openEditTemplateModal(t)}
+                          title="Edit Template"
+                          className="p-1 text-slate-500 hover:text-amber-600 rounded hover:bg-white cursor-pointer"
+                        >
+                          <PenTool className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteTemplate(t)}
+                          title="Delete Template"
+                          className="p-1 text-slate-500 hover:text-red-600 rounded hover:bg-white cursor-pointer"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
                     <p className="text-xs text-slate-600 line-clamp-2">
                       {t.introductionText}
                     </p>
-                    <div className="text-xs text-slate-500 pt-1">
-                      Duration: <strong>{t.defaultDurationMonths || 12} Months</strong> •{" "}
-                      General Commitments:{" "}
-                      <strong>{t.generalResponsibilities?.length || 0} items</strong>
+                    <div className="text-xs text-slate-500 pt-1 flex items-center justify-between">
+                      <span>
+                        Duration: <strong>{t.defaultDurationMonths || 12} Months</strong> •{" "}
+                        <strong>{t.generalResponsibilities?.length || 0} commitments</strong>
+                      </span>
+                      <span className="text-[#004aad] font-medium">Click to view contents →</span>
                     </div>
                   </div>
                 ))}
@@ -924,15 +1012,16 @@ export default function ContractsPage() {
                       const memberName = getUserName(agr.userId);
 
                       let validityText = "Not Activated";
-                      try {
-                        const start = agr.duration?.startDate?.toDate ? agr.duration.startDate.toDate() : agr.duration?.startDate ? new Date(agr.duration.startDate) : null;
-                        const end = agr.duration?.endDate?.toDate ? agr.duration.endDate.toDate() : agr.duration?.endDate ? new Date(agr.duration.endDate) : null;
-                        if (start && end && !isNaN(start.getTime()) && !isNaN(end.getTime())) {
-                          validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
-                        }
-                      } catch (e) {
-                        validityText = "Active Term";
-                      }
+                          try {
+                            const start = parseSafeDate(agr.duration?.startDate);
+                            const end = parseSafeDate(agr.duration?.endDate);
+
+                            if (start && end) {
+                              validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
+                            }
+                          } catch (e) {
+                            validityText = "Active Term";
+                          }
 
                       const statusKey = agr.status || "draft";
 
@@ -960,7 +1049,7 @@ export default function ContractsPage() {
                               {statusKey.replace("_", " ")}
                             </span>
                           </td>
-                          <td className="py-3.5 px-4 text-right">
+                          <td className="py-3.5 px-4 text-right space-x-2">
                             <button
                               onClick={() => {
                                 setReviewingAgreement(agr);
@@ -971,6 +1060,21 @@ export default function ContractsPage() {
                             >
                               <FileSignature className="h-3.5 w-3.5" />
                               <span>Inspect & Review</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                downloadOfficialAgreementPdf(
+                                  agr,
+                                  agr.termsSnapshot || DEFAULT_ICEP_TERMS_AND_CONDITIONS,
+                                  agr.memberSnapshot?.workingGroupName
+                                )
+                              }
+                              title="Download Official PDF"
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-[#004aad] hover:bg-[#003882] rounded-lg cursor-pointer"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>PDF</span>
                             </button>
                           </td>
                         </tr>
@@ -998,12 +1102,28 @@ export default function ContractsPage() {
                   {getUserName(reviewingAgreement.userId)} ({reviewingAgreement.memberSnapshot?.workingGroupName || "Assigned Working Group"})
                 </h3>
               </div>
-              <button
-                onClick={() => setReviewingAgreement(null)}
-                className="text-slate-400 hover:text-slate-600 p-2 rounded-lg hover:bg-slate-200/50 cursor-pointer text-sm font-bold"
-              >
-                ✕ Close
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadOfficialAgreementPdf(
+                      reviewingAgreement,
+                      reviewingAgreement.termsSnapshot || DEFAULT_ICEP_TERMS_AND_CONDITIONS,
+                      reviewingAgreement.memberSnapshot?.workingGroupName
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#004aad] hover:bg-[#003882] rounded-lg cursor-pointer transition-colors shadow-sm"
+                >
+                  <Download className="h-4 w-4" />
+                  <span>Download Official PDF</span>
+                </button>
+                <button
+                  onClick={() => setReviewingAgreement(null)}
+                  className="text-slate-400 hover:text-slate-600 p-2 rounded-lg hover:bg-slate-200/50 cursor-pointer text-sm font-bold"
+                >
+                  ✕ Close
+                </button>
+              </div>
             </div>
 
             {/* Modal Body: Full Agreement Preview & Decision Form */}
@@ -1172,7 +1292,6 @@ export default function ContractsPage() {
           </div>
         </div>
       )}
-
       {/* THREE-STAGE SIGNING WIZARD MODAL */}
       {activeSigningAgreement && activeTemplate && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
