@@ -8,6 +8,7 @@ import { canManageOrganization } from "@/lib/permissions";
 import { downloadOfficialAgreementPdf } from "@/lib/agreementPdfGenerator";
 import {
   fetchAgreementTemplates,
+  formatAgreementDate,
   fetchAgreements,
   createAgreementTemplate,
   deleteAgreementTemplate,
@@ -15,6 +16,7 @@ import {
   saveOrSubmitAgreement,
   reviewAgreement,
 } from "@/lib/agreementService";
+import { sendAgreementEmail } from "@/lib/emailService";
 import { fetchAllUsers } from "@/lib/orgService";
 import { AgreementTemplate, Agreement, UserProfile, AgreementType } from "@/types";
 import {
@@ -118,6 +120,39 @@ export default function ContractsPage() {
   const [tplTerms, setTplTerms] = useState("");
   const [tplDuration, setTplDuration] = useState<number>(12);
   const [creatingTpl, setCreatingTpl] = useState(false);
+
+  const buildFormalWelcomeMessage = (
+  agreement: Agreement,
+  customNote?: string
+) => {
+  const memberName = agreement.memberSnapshot?.fullName || "Member";
+  const positionTitle = agreement.memberSnapshot?.positionTitle || "Member";
+  const workingGroup = agreement.memberSnapshot?.workingGroupName;
+  const subTeam = agreement.memberSnapshot?.subTeamName;
+
+  const teamLine = [
+    workingGroup && workingGroup !== "Unassigned" ? workingGroup : null,
+    subTeam && subTeam !== "Unassigned" ? subTeam : null,
+  ]
+    .filter(Boolean)
+    .join(" — ");
+
+  const startStr = formatAgreementDate(agreement.duration?.startDate);
+  const endStr = formatAgreementDate(agreement.duration?.endDate);
+
+  let welcome =
+    `Welcome to the International Commission for Equity and Peace (ICEP), ${memberName}! ` +
+    `Your agreement for the role of ${positionTitle}` +
+    (teamLine ? ` (${teamLine})` : "") +
+    ` has been officially approved for the term of ${startStr} to ${endStr}. ` +
+    `We are honored to have your commitment, voice, and collaboration in advancing equity and peace.`;
+
+  if (customNote && customNote.trim()) {
+    welcome += `\n\nAdditional Note from ICEP Leadership: ${customNote.trim()}`;
+  }
+
+  return welcome;
+};
 
   // Helper function to safely parse Firestore Timestamps or date strings
 const parseSafeDate = (val: any): Date | null => {
@@ -619,118 +654,166 @@ const parseSafeDate = (val: any): Date | null => {
     }
   };
 
-  const handleReviewSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!profile || !reviewingAgreement) return;
-    setSubmittingReview(true);
+ const handleReviewSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+  if (!profile || !reviewingAgreement) return;
+  setSubmittingReview(true);
 
-    try {
-      await reviewAgreement(
-        reviewingAgreement.id,
-        reviewDecision,
-        adminFeedback.trim(),
-        { uid: profile.uid, role: profile.role }
-      );
+  try {
+    const trimmedFeedback = adminFeedback.trim();
 
-      setReviewingAgreement(null);
-      setAdminFeedback("");
-      await loadData();
-    } catch (error) {
-      console.error("Failed to review agreement:", error);
-      setErrorMsg(error instanceof Error ? error.message : "Failed to submit review.");
-    } finally {
-      setSubmittingReview(false);
+    // If approved, store a formal ICEP welcome message (including any optional custom note)
+    // instead of treating it as a correction note.
+    const feedbackToStore =
+      reviewDecision === "approved"
+        ? buildFormalWelcomeMessage(reviewingAgreement, trimmedFeedback)
+        : trimmedFeedback;
+
+    await reviewAgreement(
+      reviewingAgreement.id,
+      reviewDecision,
+      feedbackToStore,
+      { uid: profile.uid, role: profile.role }
+    );
+
+    // Send Automated Email Notification to Member
+    const memberEmail = reviewingAgreement.memberSnapshot?.email;
+    if (memberEmail) {
+      const statusLabel =
+        reviewDecision === "approved"
+          ? "APPROVED & ACTIVE"
+          : reviewDecision.replace("_", " ").toUpperCase();
+
+      const agreementTitle =
+        reviewingAgreement.type === "position_specific"
+          ? `Position-Specific Agreement (${reviewingAgreement.memberSnapshot?.positionTitle || "Member"})`
+          : "Membership Commitment Agreement";
+
+      const subject =
+        reviewDecision === "approved"
+          ? `Welcome to ICEP — ${agreementTitle} Approved`
+          : `ICEP Agreement Update: ${statusLabel}`;
+
+      const startStr = formatAgreementDate(reviewingAgreement.duration?.startDate);
+      const endStr = formatAgreementDate(reviewingAgreement.duration?.endDate);
+
+      let msg =
+        reviewDecision === "approved"
+          ? `${feedbackToStore}\n\nAgreement: ${agreementTitle}\nContract Duration: ${startStr} – ${endStr}`
+          : `Hello ${reviewingAgreement.memberSnapshot?.fullName || "Member"},\n\n` +
+            `Your ICEP ${agreementTitle} status has been updated to: ${statusLabel}.\n\n` +
+            `Required Action / Feedback: "${trimmedFeedback}"`;
+
+      try {
+        await sendAgreementEmail({
+          to: memberEmail,
+          subject,
+          message: msg,
+          actionUrl: `${window.location.origin}/contracts`,
+        });
+      } catch (emailErr) {
+        console.warn("Agreement updated, but email notification failed:", emailErr);
+      }
     }
-  };
 
-  const openEditTemplateModal = (tpl: AgreementTemplate) => {
-    setEditingTemplateId(tpl.id);
-    setTplType(tpl.type || "membership_commitment");
-    setTplTitle(tpl.title);
-    setTplVersion(tpl.version || 1);
-    setTplIntro(tpl.introductionText || "");
-    setTplGeneralResp((tpl.generalResponsibilities || []).join("\n"));
-    setTplParticipation((tpl.participationRequirements || []).join("\n"));
-    setTplTerms(tpl.termsAndConditions || "");
-    setTplDuration(tpl.defaultDurationMonths || 12);
-    setShowTemplateModal(true); // Your existing template creation modal state
-  };
+    setReviewingAgreement(null);
+    setAdminFeedback("");
+    await loadData();
+  } catch (error) {
+    console.error("Failed to review agreement:", error);
+    setErrorMsg(
+      error instanceof Error ? error.message : "Failed to submit review."
+    );
+  } finally {
+    setSubmittingReview(false);
+  }
+};
 
-  const handleDeleteTemplate = async (tpl: AgreementTemplate) => {
-    if (!window.confirm(`Delete "${tpl.title}" permanently? Existing signed member snapshots will remain preserved.`)) return;
-    try {
-      await deleteAgreementTemplate(tpl.id);
-      await loadData();
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to delete template.");
-    }
-  };
+const openEditTemplateModal = (tpl: AgreementTemplate) => {
+  setEditingTemplateId(tpl.id);
+  setTplType(tpl.type || "membership_commitment");
+  setTplTitle(tpl.title);
+  setTplVersion(tpl.version || 1);
+  setTplIntro(tpl.introductionText || "");
+  setTplGeneralResp((tpl.generalResponsibilities || []).join("\n"));
+  setTplParticipation((tpl.participationRequirements || []).join("\n"));
+  setTplTerms(tpl.termsAndConditions || "");
+  setTplDuration(tpl.defaultDurationMonths || 12);
+  setShowTemplateModal(true);
+};
+
+const handleDeleteTemplate = async (tpl: AgreementTemplate) => {
+  if (!window.confirm(`Delete "${tpl.title}" permanently? Existing signed member snapshots will remain preserved.`)) return;
+  try {
+    await deleteAgreementTemplate(tpl.id);
+    await loadData();
+  } catch (err) {
+    alert(err instanceof Error ? err.message : "Failed to delete template.");
+  }
+};
 
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2.5 flex-wrap">
-            <h1 className="text-2xl font-bold text-slate-900">
-              Contracts & Agreements Hub
-            </h1>
-            <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-              {showAdminView ? "Admin Mode" : "Member Portal"}
-            </span>
-          </div>
-          <p className="text-sm text-slate-500 mt-1">
-            Membership commitment agreements, duration tracking, three-stage wizard, and executive review.
-          </p>
-        </div>
+  <div>
+    <h1 className="text-2xl font-bold text-slate-900">
+      Contracts & Agreements
+    </h1>
+    <p className="text-sm text-slate-500 mt-1">
+      Manage member agreements, templates, and review approvals.
+    </p>
+  </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          {isAdminOrExec && (
-            <div className="inline-flex rounded-lg border border-slate-300 bg-white p-0.5">
-              <button
-                type="button"
-                onClick={() => setViewMode("admin")}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                  viewMode === "admin"
-                    ? "bg-slate-900 text-white"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                Admin Management
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewMode("member")}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                  viewMode === "member"
-                    ? "bg-slate-900 text-white"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                My Personal Agreements
-              </button>
-            </div>
-          )}
-
-          <button
-            onClick={loadData}
-            title="Refresh Data"
-            className="p-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg transition-colors cursor-pointer"
-          >
-            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-          </button>
-
-          {showAdminView && (
-            <button
-              onClick={() => setShowTemplateModal(true)}
-              className="inline-flex items-center gap-2 px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
-            >
-              <Plus className="h-4 w-4" />
-              <span>New Template</span>
-            </button>
-          )}
-        </div>
+  <div className="flex items-center gap-2 flex-wrap">
+    {isAdminOrExec && (
+      <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 shadow-2xs">
+        <button
+          type="button"
+          onClick={() => setViewMode("admin")}
+          className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+            viewMode === "admin"
+              ? "bg-[#004aad] text-white shadow-2xs"
+              : "text-slate-600 hover:bg-[#004aad]/5 hover:text-[#004aad]"
+          }`}
+        >
+          Admin Management
+        </button>
+        <button
+          type="button"
+          onClick={() => setViewMode("member")}
+          className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+            viewMode === "member"
+              ? "bg-[#004aad] text-white shadow-2xs"
+              : "text-slate-600 hover:bg-[#004aad]/5 hover:text-[#004aad]"
+          }`}
+        >
+          My Personal Agreements
+        </button>
       </div>
+    )}
+
+    <button
+      type="button"
+      onClick={loadData}
+      title="Refresh Data"
+      className="p-2.5 bg-white border border-slate-200 hover:border-[#004aad]/40 hover:bg-[#004aad]/5 text-slate-700 hover:text-[#004aad] rounded-lg transition-colors cursor-pointer"
+    >
+      <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+    </button>
+
+    {showAdminView && (
+      <button
+        type="button"
+        onClick={() => setShowTemplateModal(true)}
+        className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#004aad] hover:bg-[#003882] text-white text-sm font-medium rounded-lg shadow-2xs transition-colors cursor-pointer"
+      >
+        <Plus className="h-4 w-4" />
+        <span>New Template</span>
+      </button>
+    )}
+  </div>
+</div>
 
       {errorMsg && (
         <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
@@ -813,14 +896,33 @@ const parseSafeDate = (val: any): Date | null => {
                         {tpl.introductionText}
                       </p>
                       {existingAgr?.review?.adminFeedback && (
-                        <div className="mt-2 p-2.5 rounded bg-orange-50 border border-orange-200 text-xs text-orange-800 flex items-start gap-2">
-                          <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-                          <span>
-                            <strong>Admin Feedback / Correction Required:</strong>{" "}
-                            {existingAgr.review.adminFeedback}
-                          </span>
-                        </div>
-                      )}
+                          existingAgr.status === "active" ||
+                          existingAgr.review.decision === "approved" ? (
+                            <div className="mt-2.5 p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-900">
+                              <p className="font-semibold text-emerald-800 mb-1">
+                                Official Welcome from ICEP
+                              </p>
+                              <p className="leading-relaxed whitespace-pre-line">
+                                {existingAgr.review.adminFeedback}
+                              </p>
+                            </div>
+                          ) : existingAgr.status === "needs_correction" ||
+                            existingAgr.review.decision === "needs_correction" ? (
+                            <div className="mt-2 p-2.5 rounded bg-orange-50 border border-orange-200 text-xs text-orange-800 flex items-start gap-2">
+                              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                              <span>
+                                <strong>Correction Required:</strong> {existingAgr.review.adminFeedback}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="mt-2 p-2.5 rounded bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-start gap-2">
+                              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                              <span>
+                                <strong>Review Note:</strong> {existingAgr.review.adminFeedback}
+                              </span>
+                            </div>
+                          )
+                        )}
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
@@ -883,26 +985,29 @@ const parseSafeDate = (val: any): Date | null => {
         </div>
       )}
 
-     {/* ADMIN & EXEC VIEW */}
+    {/* ADMIN & EXEC VIEW */}
       {showAdminView && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs">
-            <div className="flex items-center justify-between mb-4">
-              <div>
+        <div className="space-y-6 min-w-0">
+          <div className="bg-white rounded-xl border border-slate-200 p-4 sm:p-6 shadow-2xs">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+              <div className="min-w-0">
                 <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                  <ShieldCheck className="h-5 w-5 text-indigo-600" />
-                  <span>Agreement Templates ({templates.length})</span>
+                  <ShieldCheck className="h-5 w-5 text-[#004aad] shrink-0" />
+                  <span className="truncate">
+                    Agreement Templates ({templates.length})
+                  </span>
                 </h2>
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-slate-500 mt-0.5">
                   Published commitment and policy templates for organizational members. Click any template to inspect full contents.
                 </p>
               </div>
 
               {templates.length === 0 && (
                 <button
+                  type="button"
                   onClick={seedSampleTemplate}
                   disabled={creatingTpl}
-                  className="inline-flex items-center gap-2 px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-semibold rounded-lg border border-emerald-200 transition-colors cursor-pointer"
+                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 bg-[#004aad] hover:bg-[#003882] text-white text-xs font-semibold rounded-lg shadow-2xs transition-colors cursor-pointer shrink-0 disabled:opacity-50"
                 >
                   <Plus className="h-3.5 w-3.5" />
                   <span>
@@ -922,21 +1027,24 @@ const parseSafeDate = (val: any): Date | null => {
                   <div
                     key={t.id}
                     onClick={() => setInspectingTemplate(t)}
-                    className="p-4 rounded-lg border border-slate-200 bg-slate-50 hover:border-indigo-300 hover:bg-indigo-50/20 transition-all cursor-pointer space-y-2"
+                    className="p-4 rounded-xl border border-slate-200 bg-white hover:border-[#004aad]/50 hover:bg-[#004aad]/[0.02] transition-all cursor-pointer space-y-2.5 min-w-0"
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <div className="font-semibold text-sm text-slate-900 hover:text-[#004aad]">
+                      <div className="font-semibold text-sm text-slate-900 hover:text-[#004aad] min-w-0 break-words">
                         {t.title}
                       </div>
-                      <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-medium">
+                      <div
+                        className="flex items-center gap-1 shrink-0"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <span className="text-xs px-2 py-0.5 rounded bg-[#004aad]/10 text-[#004aad] border border-[#004aad]/20 font-medium">
                           v{t.version}
                         </span>
                         <button
                           type="button"
                           onClick={() => setInspectingTemplate(t)}
                           title="Inspect Full Template"
-                          className="p-1 text-slate-500 hover:text-[#004aad] rounded hover:bg-white cursor-pointer"
+                          className="p-1.5 text-slate-500 hover:text-[#004aad] rounded-lg hover:bg-[#004aad]/5 cursor-pointer"
                         >
                           <Eye className="h-3.5 w-3.5" />
                         </button>
@@ -944,7 +1052,7 @@ const parseSafeDate = (val: any): Date | null => {
                           type="button"
                           onClick={() => openEditTemplateModal(t)}
                           title="Edit Template"
-                          className="p-1 text-slate-500 hover:text-amber-600 rounded hover:bg-white cursor-pointer"
+                          className="p-1.5 text-slate-500 hover:text-[#004aad] rounded-lg hover:bg-[#004aad]/5 cursor-pointer"
                         >
                           <PenTool className="h-3.5 w-3.5" />
                         </button>
@@ -952,21 +1060,31 @@ const parseSafeDate = (val: any): Date | null => {
                           type="button"
                           onClick={() => handleDeleteTemplate(t)}
                           title="Delete Template"
-                          className="p-1 text-slate-500 hover:text-red-600 rounded hover:bg-white cursor-pointer"
+                          className="p-1.5 text-slate-500 hover:text-red-600 rounded-lg hover:bg-red-50 cursor-pointer"
                         >
                           <X className="h-3.5 w-3.5" />
                         </button>
                       </div>
                     </div>
+
                     <p className="text-xs text-slate-600 line-clamp-2">
                       {t.introductionText}
                     </p>
-                    <div className="text-xs text-slate-500 pt-1 flex items-center justify-between">
+
+                    <div className="text-xs text-slate-500 pt-1.5 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
                       <span>
-                        Duration: <strong>{t.defaultDurationMonths || 12} Months</strong> •{" "}
-                        <strong>{t.generalResponsibilities?.length || 0} commitments</strong>
+                        Duration:{" "}
+                        <strong className="text-slate-700">
+                          {t.defaultDurationMonths || 12} Months
+                        </strong>{" "}
+                        •{" "}
+                        <strong className="text-slate-700">
+                          {t.generalResponsibilities?.length || 0} commitments
+                        </strong>
                       </span>
-                      <span className="text-[#004aad] font-medium">Click to view contents →</span>
+                      <span className="text-[#004aad] font-medium shrink-0">
+                        Click to view contents →
+                      </span>
                     </div>
                   </div>
                 ))}
@@ -974,12 +1092,14 @@ const parseSafeDate = (val: any): Date | null => {
             )}
           </div>
 
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs">
-            <div className="p-5 border-b border-slate-200 bg-slate-50/70 flex items-center justify-between">
-              <div>
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
+            <div className="p-4 sm:p-5 border-b border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="min-w-0">
                 <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                  <Users className="h-5 w-5 text-indigo-600" />
-                  <span>Member Agreement Submissions ({agreements.length})</span>
+                  <Users className="h-5 w-5 text-[#004aad] shrink-0" />
+                  <span className="truncate">
+                    Member Agreement Submissions ({agreements.length})
+                  </span>
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
                   All member drafts, pending submissions, active signed agreements, and lifecycle statuses.
@@ -996,93 +1116,185 @@ const parseSafeDate = (val: any): Date | null => {
                 No member agreements created or submitted yet. Switch to &ldquo;My Personal Agreements&rdquo; above to preview and test signing!
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      <th className="py-3 px-4">Member</th>
-                      <th className="py-3 px-4">Working Group</th>
-                      <th className="py-3 px-4">Validity Period</th>
-                      <th className="py-3 px-4">Status</th>
-                      <th className="py-3 px-4 text-right">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-sm">
-                    {agreements.map((agr) => {
-                      const memberName = getUserName(agr.userId);
+              <>
+                {/* Mobile Card List (< md) */}
+                <div className="md:hidden divide-y divide-slate-100">
+                  {agreements.map((agr, idx) => {
+                    const memberName = getUserName(agr.userId);
 
-                      let validityText = "Not Activated";
-                          try {
-                            const start = parseSafeDate(agr.duration?.startDate);
-                            const end = parseSafeDate(agr.duration?.endDate);
+                    let validityText = "Not Activated";
+                    try {
+                      const start = parseSafeDate(agr.duration?.startDate);
+                      const end = parseSafeDate(agr.duration?.endDate);
 
-                            if (start && end) {
-                              validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
+                      if (start && end) {
+                        validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
+                      }
+                    } catch {
+                      validityText = "Active Term";
+                    }
+
+                    const statusKey = agr.status || "draft";
+
+                    return (
+                      <div
+                        key={agr.id || `mobile-agr-${idx}`}
+                        className="p-4 space-y-3 bg-white"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="font-semibold text-sm text-slate-900 truncate">
+                              {memberName}
+                            </p>
+                            <p className="text-xs text-slate-500 truncate">
+                              {agr.memberSnapshot?.workingGroupName ||
+                                "Unassigned"}
+                            </p>
+                          </div>
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full text-xs font-medium border capitalize shrink-0 ${
+                              AGREEMENT_STATUS_BADGES[statusKey] ||
+                              "bg-slate-100 text-slate-600 border-slate-200"
+                            }`}
+                          >
+                            {statusKey.replace("_", " ")}
+                          </span>
+                        </div>
+
+                        <p className="text-xs text-slate-500">
+                          <strong className="text-slate-700">Validity:</strong>{" "}
+                          {validityText}
+                        </p>
+
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReviewingAgreement(agr);
+                              setReviewDecision("approved");
+                              setAdminFeedback(agr.review?.adminFeedback || "");
+                            }}
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-[#004aad]/5 hover:text-[#004aad] cursor-pointer"
+                          >
+                            <FileSignature className="h-3.5 w-3.5" />
+                            <span>Inspect & Review</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              downloadOfficialAgreementPdf(
+                                agr,
+                                agr.termsSnapshot ||
+                                  DEFAULT_ICEP_TERMS_AND_CONDITIONS,
+                                agr.memberSnapshot?.workingGroupName
+                              )
                             }
-                          } catch (e) {
-                            validityText = "Active Term";
+                            title="Download Official PDF"
+                            className="inline-flex items-center justify-center gap-1 px-3 py-2 text-xs font-medium text-white bg-[#004aad] hover:bg-[#003882] rounded-lg cursor-pointer shrink-0"
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                            <span>PDF</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Desktop Table (>= md) */}
+                <div className="hidden md:block overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                        <th className="py-3 px-4">Member</th>
+                        <th className="py-3 px-4">Working Group</th>
+                        <th className="py-3 px-4">Validity Period</th>
+                        <th className="py-3 px-4">Status</th>
+                        <th className="py-3 px-4 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 text-sm">
+                      {agreements.map((agr, idx) => {
+                        const memberName = getUserName(agr.userId);
+
+                        let validityText = "Not Activated";
+                        try {
+                          const start = parseSafeDate(agr.duration?.startDate);
+                          const end = parseSafeDate(agr.duration?.endDate);
+
+                          if (start && end) {
+                            validityText = `${start.toLocaleDateString()} - ${end.toLocaleDateString()}`;
                           }
+                        } catch {
+                          validityText = "Active Term";
+                        }
 
-                      const statusKey = agr.status || "draft";
+                        const statusKey = agr.status || "draft";
 
-                      return (
-                        <tr
-                          key={agr.id || Math.random()}
-                          className="hover:bg-slate-50 transition-colors"
-                        >
-                          <td className="py-3.5 px-4 font-semibold text-slate-900">
-                            {memberName}
-                          </td>
-                          <td className="py-3.5 px-4 text-slate-600">
-                            {agr.memberSnapshot?.workingGroupName || "Unassigned"}
-                          </td>
-                          <td className="py-3.5 px-4 text-xs text-slate-500">
-                            {validityText}
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <span
-                              className={`px-2.5 py-0.5 rounded-full text-xs font-medium border capitalize ${
-                                AGREEMENT_STATUS_BADGES[statusKey] ||
-                                "bg-slate-100 text-slate-600 border-slate-200"
-                              }`}
-                            >
-                              {statusKey.replace("_", " ")}
-                            </span>
-                          </td>
-                          <td className="py-3.5 px-4 text-right space-x-2">
-                            <button
-                              onClick={() => {
-                                setReviewingAgreement(agr);
-                                setReviewDecision("approved");
-                                setAdminFeedback(agr.review?.adminFeedback || "");
-                              }}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-                            >
-                              <FileSignature className="h-3.5 w-3.5" />
-                              <span>Inspect & Review</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                downloadOfficialAgreementPdf(
-                                  agr,
-                                  agr.termsSnapshot || DEFAULT_ICEP_TERMS_AND_CONDITIONS,
-                                  agr.memberSnapshot?.workingGroupName
-                                )
-                              }
-                              title="Download Official PDF"
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-[#004aad] hover:bg-[#003882] rounded-lg cursor-pointer"
-                            >
-                              <Download className="h-3.5 w-3.5" />
-                              <span>PDF</span>
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                        return (
+                          <tr
+                            key={agr.id || `desktop-agr-${idx}`}
+                            className="hover:bg-[#004aad]/[0.02] transition-colors"
+                          >
+                            <td className="py-3.5 px-4 font-semibold text-slate-900">
+                              {memberName}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-600">
+                              {agr.memberSnapshot?.workingGroupName ||
+                                "Unassigned"}
+                            </td>
+                            <td className="py-3.5 px-4 text-xs text-slate-500">
+                              {validityText}
+                            </td>
+                            <td className="py-3.5 px-4">
+                              <span
+                                className={`px-2.5 py-0.5 rounded-full text-xs font-medium border capitalize ${
+                                  AGREEMENT_STATUS_BADGES[statusKey] ||
+                                  "bg-slate-100 text-slate-600 border-slate-200"
+                                }`}
+                              >
+                                {statusKey.replace("_", " ")}
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-4 text-right whitespace-nowrap space-x-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setReviewingAgreement(agr);
+                                  setReviewDecision("approved");
+                                  setAdminFeedback(
+                                    agr.review?.adminFeedback || ""
+                                  );
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:border-[#004aad]/40 hover:text-[#004aad] cursor-pointer"
+                              >
+                                <FileSignature className="h-3.5 w-3.5" />
+                                <span>Inspect & Review</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  downloadOfficialAgreementPdf(
+                                    agr,
+                                    agr.termsSnapshot ||
+                                      DEFAULT_ICEP_TERMS_AND_CONDITIONS,
+                                    agr.memberSnapshot?.workingGroupName
+                                  )
+                                }
+                                title="Download Official PDF"
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-[#004aad] hover:bg-[#003882] rounded-lg cursor-pointer"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                <span>PDF</span>
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
             )}
           </div>
         </div>
@@ -1259,15 +1471,24 @@ const parseSafeDate = (val: any): Date | null => {
 
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">
-                    Feedback / Revision Notes for Member *
+                    {reviewDecision === "approved"
+                      ? "Optional Personal Welcome Note for Member (Formal ICEP Welcome is added automatically)"
+                      : "Feedback / Revision Notes for Member *"}
                   </label>
                   <textarea
                     rows={3}
                     value={adminFeedback}
                     onChange={(e) => setAdminFeedback(e.target.value)}
-                    placeholder="Provide clear reasons for approval, requested corrections, or termination..."
+                    placeholder={
+                      reviewDecision === "approved"
+                        ? "Optional: Add a personal welcome note or onboarding next step..."
+                        : "Provide clear reasons for requested corrections or rejection..."
+                    }
                     className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
-                    required={reviewDecision === "needs_correction" || reviewDecision === "rejected"}
+                    required={
+                      reviewDecision === "needs_correction" ||
+                      reviewDecision === "rejected"
+                    }
                   />
                 </div>
 

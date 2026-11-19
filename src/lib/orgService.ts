@@ -2,6 +2,7 @@ import {
   collection,
   addDoc,
   updateDoc,
+  deleteDoc,
   doc,
   getDocs,
   query,
@@ -10,6 +11,60 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { WorkingGroup, SubTeam, UserProfile, UserRole } from "@/types";
+
+
+
+
+export async function updateWorkingGroup(
+  id: string,
+  updates: Partial<{
+    name: string;
+    description: string;
+    missionAndObjectives: string;
+    chairId: string | null;
+    isActive: boolean;
+    defaultResponsibilities: string[];
+  }>,
+  _actor?: { uid: string; role?: string }
+) {
+  const ref = doc(db, "workingGroups", id);
+  await updateDoc(ref, {
+    ...updates,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+export async function deleteWorkingGroup(
+  id: string,
+  _actor?: { uid: string; role?: string }
+) {
+  await deleteDoc(doc(db, "workingGroups", id));
+}
+
+export async function updateSubTeam(
+  id: string,
+  updates: Partial<{
+    name: string;
+    description: string;
+    leaderId: string | null;
+    isActive: boolean;
+    defaultResponsibilities: string[];
+  }>,
+  _actor?: { uid: string; role?: string }
+) {
+  const ref = doc(db, "subTeams", id);
+  await updateDoc(ref, {
+    ...updates,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+export async function deleteSubTeam(
+  id: string,
+  _actor?: { uid: string; role?: string }
+) {
+  await deleteDoc(doc(db, "subTeams", id));
+}
 
 /**
  * Record an immutable audit log entry

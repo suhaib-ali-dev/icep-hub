@@ -330,16 +330,17 @@ export default function MembersPage() {
 
           {isAdminOrExec && (
             <button
-              onClick={() => {
-                setInviteSuccess(null);
-                setInviteError(null);
-                setShowInviteModal(true);
-              }}
-              className="inline-flex items-center gap-2 px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg transition-colors cursor-pointer"
-            >
-              <UserPlus className="h-4 w-4" />
-              <span>Invite Member</span>
-            </button>
+                type="button"
+                onClick={() => {
+                  setInviteSuccess(null);
+                  setInviteError(null);
+                  setShowInviteModal(true);
+                }}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#004aad] hover:bg-[#003882] text-white text-sm font-medium rounded-lg shadow-2xs transition-colors cursor-pointer"
+              >
+                <UserPlus className="h-4 w-4" />
+                <span>Invite Member</span>
+              </button>
           )}
         </div>
       </div>
@@ -726,7 +727,7 @@ export default function MembersPage() {
                   <button
                     type="submit"
                     disabled={inviting}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg disabled:opacity-50 cursor-pointer"
+                    className="px-4 py-2 bg-[#004aad] hover:bg-[#003882] text-white text-sm font-medium rounded-lg shadow-2xs disabled:opacity-50 transition-colors cursor-pointer"
                   >
                     {inviting ? "Sending Invite..." : "Create Account & Invite"}
                   </button>
@@ -885,10 +886,10 @@ export default function MembersPage() {
                 >
                   Cancel
                 </button>
-                <button
+               <button
                   type="submit"
                   disabled={savingEdit}
-                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-lg disabled:opacity-50 cursor-pointer"
+                  className="px-4 py-2 bg-[#004aad] hover:bg-[#003882] text-white text-sm font-medium rounded-lg shadow-2xs disabled:opacity-50 transition-colors cursor-pointer"
                 >
                   {savingEdit ? "Saving..." : "Save Changes"}
                 </button>

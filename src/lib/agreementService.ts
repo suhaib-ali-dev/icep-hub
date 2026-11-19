@@ -30,6 +30,36 @@ export async function deleteAgreementTemplate(templateId: string) {
   await deleteDoc(ref);
 }
 
+import { Timestamp } from "firebase/firestore";
+
+export function formatAgreementDate(
+  value?: Timestamp | Date | string | number | null
+): string {
+  if (!value) return "N/A";
+
+  let date: Date;
+  if (typeof (value as Timestamp)?.toDate === "function") {
+    date = (value as Timestamp).toDate();
+  } else if (
+    typeof value === "object" &&
+    value !== null &&
+    "seconds" in value &&
+    typeof (value as { seconds: unknown }).seconds === "number"
+  ) {
+    date = new Date((value as { seconds: number }).seconds * 1000);
+  } else {
+    date = new Date(value as string | number | Date);
+  }
+
+  if (Number.isNaN(date.getTime())) return "N/A";
+
+  return date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 export async function queueAgreementNotification(params: {
   to: string;
   subject: string;
